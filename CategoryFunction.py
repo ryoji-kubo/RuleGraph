@@ -57,7 +57,7 @@ class CategoryFunction:
     def __init__(self, 
                  data, 
                  max_rel_combination=3, 
-                 minsup=0.01,
+                 minsup=0.0,
                  ent_overlap=0.90,
                  rel_overlap=0.90,
                  num_perm=128,
@@ -93,6 +93,8 @@ class CategoryFunction:
         self.dynamic_total_max_aggregation_factor = dynamic_total_max_aggregation_factor
         self.min_k_categories = min_k_categories
 
+        self.prefixSpan_file = f"prefixSpan_minsup{self.minsup}_maxLength{self.max_rel_combination}.txt"
+
     def get_category_functions(self):
         # 1. Get the Interaction relation set for all the entities.
         rel_set = []
@@ -107,9 +109,11 @@ class CategoryFunction:
         # 2. Get the topk freq rel combinations using prefixSpan Algo.
         print("Running PrefixSpan Algorithm...")
         spmf = Spmf("PrefixSpan", spmf_bin_location_dir=current_directory, input_direct=rel_set,
-            output_filename='output.txt',
+            output_filename=self.prefixSpan_file,
             arguments=[self.minsup, self.max_rel_combination, True])
-        spmf.run()
+        
+        if not os.path.exists(self.prefixSpan_file):
+            spmf.run()
         df = spmf.to_pandas_dataframe_with_SIDs()
 
         # if specified, dynamically calculate the max aggr

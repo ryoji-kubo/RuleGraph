@@ -13,7 +13,6 @@ from dataclasses import dataclass
 class HeapItem:
     sup: int
     row: dict
-    indices: tuple
 
     def __lt__(self, other):
         return self.sup < other.sup
@@ -32,6 +31,7 @@ def to_pandas_dataframe_with_SIDs(self, pickle=False):
     patterns_dict_list = []
     for pattern_sup in self.patterns_:
         pattern = pattern_sup[:-1]
+        pattern = [int(p)-1 for p in pattern] # we added 1 to make the rels a positive int, so subtract 1 to get their original ids
         sup = pattern_sup[-1:][0]
         sup = sup.strip()
         if not sup.startswith("#SUP"):
@@ -42,7 +42,7 @@ def to_pandas_dataframe_with_SIDs(self, pickle=False):
         sids = [int(id) for id in sids]
         sup = sup[1]
 
-        patterns_dict_list.append({'pattern': pattern, 'sup': int(sup), 'sID': sids})
+        patterns_dict_list.append({'pattern': pattern, 'sup': int(sup), 'sID': sorted(sids)})
 
     df = pd.DataFrame(patterns_dict_list)
     self.df_ = df
@@ -53,8 +53,13 @@ def to_pandas_dataframe_with_SIDs(self, pickle=False):
 # A customized function that will read the Support IDs from prefixSpan
 Spmf.to_pandas_dataframe_with_SIDs = to_pandas_dataframe_with_SIDs
 
+def hash_set(s):
+    return hash(tuple(sorted(s)))
+
 class CategoryFunction:
     def __init__(self, 
+                 dataset_name, 
+                 root,
                  data, 
                  max_rel_combination=3, 
                  minsup=0.0,
@@ -63,12 +68,14 @@ class CategoryFunction:
                  num_perm=128,
                  max_per_aggregation=-1,
                  total_max_aggregation=-1,
-                 dynamic_max_per_aggregation_factor=0.5,
-                 dynamic_total_max_aggregation_factor=2,
-                 min_k_categories=3
+                 dynamic_max_per_aggregation_factor=-1,
+                 dynamic_total_max_aggregation_factor=-1,
+                 min_k_categories=1
                  ):
         '''
         Args:
+            dataset_name: the name of the dataset
+            root: the root_dir of where to save the processed files
             data: the training graph data to construct the Category Function from
             max_rel_combination: the maximum number of rel combinations. (default: 3)
             minsup: the minimum support to find the topk freq rel combinations. (default: 0)
@@ -81,6 +88,8 @@ class CategoryFunction:
             dynamic_total_max_aggregation_factor: Dynamically decide what is the dynamic_total_max_aggregation_factor, a ratio of the original number of categories before aggr
             min_k_categories: The minimum number of category each entity has to belong to. 
         '''
+        self.dataset_name = dataset_name
+        self.root = root
         self.data = data
         self.max_rel_combination = max_rel_combination
         self.minsup = minsup
@@ -93,20 +102,31 @@ class CategoryFunction:
         self.dynamic_total_max_aggregation_factor = dynamic_total_max_aggregation_factor
         self.min_k_categories = min_k_categories
 
+        self.processed_dir = os.path.join(self.root, f"{self.dataset_name}/processed")
         self.prefixSpan_file = f"prefixSpan_minsup{self.minsup}_maxLength{self.max_rel_combination}.txt"
+        self.prefixSpan_file = os.path.join(self.processed_dir, self.prefixSpan_file)
+
+        self.aggregation_file = 'aggregated_categories.csv'
+        self.aggregation_file = os.path.join(self.processed_dir, self.aggregation_file)
+
+        self.category_file = os.path.join(self.processed_dir, 'category_functions.pkl')
 
     def get_category_functions(self):
-        # 1. Get the Interaction relation set for all the entities.
+        if os.path.exists(self.category_file):
+            self.category_functions = pd.read_pickle(self.category_file)
+            return 
+        
+        # Get the Interaction relation set for all the entities.
         rel_set = []
         for i in range(self.data.num_nodes):
             # restrict it to edges that has the entity i as the head
             mask = self.data.edge_index[0] == i
             rel = self.data.edge_type[mask]
             # make sure to sort the list of rels
-            rel = rel.unique(sorted=True).unsqueeze(1)
+            rel = rel.unique(sorted=True).unsqueeze(1)+1 # Spmf only recognizes positive int, add 1
             rel_set.append(rel.tolist())
 
-        # 2. Get the topk freq rel combinations using prefixSpan Algo.
+        # Get the topk freq rel combinations using prefixSpan Algo.
         print("Running PrefixSpan Algorithm...")
         spmf = Spmf("PrefixSpan", spmf_bin_location_dir=current_directory, input_direct=rel_set,
             output_filename=self.prefixSpan_file,
@@ -126,8 +146,10 @@ class CategoryFunction:
         # We will need two objects each, one for entity-based aggregation and one for relation-based aggregation
         lsh_ent = MinHashLSH(threshold=self.ent_overlap, num_perm=self.num_perm) # use MinHash with threshold
         lsh_rel = MinHashLSH(threshold=self.rel_overlap, num_perm=self.num_perm) 
-        combined_dict_ent = defaultdict(list) # for each set_i, it logs all set_j that are combined. It will keep also a symmetric record for set_j.
-        combined_dict_rel = defaultdict(list)
+        rel_hash = torch.tensor([], dtype=torch.long)
+        ent_hash = torch.tensor([], dtype=torch.long)
+        compared_dict_ent = defaultdict(list) # for each set_i, it logs all set_j that were compared. It will keep also a symmetric record for set_j.
+        compared_dict_rel = defaultdict(list)
         prev_count_ent = 0 # count how many rows of the dataframe we have already processed for ent
         prev_count_rel = 0
         minhashes_ent = [] # keeps the minhashes
@@ -135,19 +157,23 @@ class CategoryFunction:
 
         iter = 0 # keeps the number of iterations
         print('Aggregation Step')
+
+        # rel and ent hash will be used for checking duplicates
+        rel_hash, ent_hash = self.update_hash_sets(rel_hash, ent_hash, df)
+
         while (prev_count_ent < df.shape[0] or prev_count_rel < df.shape[0]): # if we still have more rows to process
-            # 3. Entity-based Aggregation
+            # Entity-based Aggregation
             print(f"* Iter {iter}: New Rows {df.shape[0]-prev_count_ent}, Total Rows {df.shape[0]} *")
-            results = self.minhash_iter('entity', prev_count_ent, lsh_ent, minhashes_ent, combined_dict_ent, df)
-            prev_count_ent, lsh_ent, minhashes_ent, combined_dict_ent, df = results
+            results = self.minhash_iter('entity', prev_count_ent, lsh_ent, rel_hash, ent_hash, minhashes_ent, compared_dict_ent, df)
+            prev_count_ent, lsh_ent, rel_hash, ent_hash, minhashes_ent, compared_dict_ent, df = results
 
             if self.total_max_aggregation == 0:
                 break
 
-            # 4. Relation-based Aggregation
+            # Relation-based Aggregation
             print(f"* Iter {iter}: New Rows {df.shape[0]-prev_count_rel}, Total Rows {df.shape[0]} *")
-            results = self.minhash_iter('relation', prev_count_rel, lsh_rel, minhashes_rel, combined_dict_rel, df)
-            prev_count_rel, lsh_rel, minhashes_rel, combined_dict_rel, df = results
+            results = self.minhash_iter('relation', prev_count_rel, lsh_rel, rel_hash, ent_hash, minhashes_rel, compared_dict_rel, df)
+            prev_count_rel, lsh_rel, rel_hash, ent_hash, minhashes_rel, compared_dict_rel, df = results
         
             if self.total_max_aggregation == 0:
                 break
@@ -157,8 +183,8 @@ class CategoryFunction:
         print("Completed the Aggregation Step")
 
         df = df.sort_values(by='sup', ascending=False).reset_index(drop=True)
+        df.to_csv(self.aggregation_file)
         entity_coverage = torch.zeros(self.data.num_nodes)
-
         satisfied = False
         for index, row in df.iterrows():
             entity_coverage[row['sID']] += 1
@@ -167,25 +193,17 @@ class CategoryFunction:
                 break
         
         assert satisfied, "It could not satisfy the min k categories requirement. Try changing the params."
+        selected_categories = df.loc[:index]
         print("Category Function Construction Complete")
 
-    def minhash_iter(self, name, prev_count, lsh, minhashes, combined_dict, df):
-        '''
-        Processes one iteration of minhash for either entity/relation - based aggregation
-        Args:
-            name: either entity/relation
-            prev_count: how many rows of the dataframe we have already processed
-            lsh: the lsh minhash obj
-            minhashes: the list of encoded minhashes 
-            combined_dict: dict keeping track of what was combined
-            df: the dataframe
-        '''
+        self.category_functions = selected_categories.rename(columns = {'pattern':'relations', 'sID': 'entities', 'sup':'num_entities'})
+        self.category_functions.to_pickle(self.category_file)
+
+    def encode_sets(self, name, prev_count, lsh, minhashes, df):
         if name == 'entity':
             intersect_column_name = 'sID'
-            union_column_name = 'pattern'
         else:
             intersect_column_name = 'pattern'
-            union_column_name = 'sID'
 
         # Encode the set
         offset = prev_count
@@ -196,6 +214,45 @@ class CategoryFunction:
             lsh.insert(f"set_{offset+i}", mh) # insert it to the lsh
             minhashes.append(mh) # append the minhash
             prev_count += 1 # update the recorded hashes
+        
+        return prev_count, lsh, minhashes
+    
+    def update_hash_sets(self, rel_hash, ent_hash, df):
+        for idx in range(rel_hash.shape[0], len(df)):
+            row = df.iloc[idx]
+            rels = tuple(row['pattern'])
+            ents = tuple(row['sID'])
+            rel_hash = torch.cat((rel_hash, torch.tensor([hash(rels)])), dim=0)
+            ent_hash = torch.cat((ent_hash, torch.tensor([hash(ents)])), dim=0)
+        return rel_hash, ent_hash
+
+    def minhash_iter(self, name, prev_count, lsh, rel_hash, ent_hash, minhashes, compared_dict, df):
+        '''
+        Processes one iteration of minhash for either entity/relation - based aggregation
+        Args:
+            name: either entity/relation
+            prev_count: how many rows of the dataframe we have already processed
+            lsh: the lsh minhash obj
+            rel_hash: the hash of set of relations, used for checking duplicates
+            ent_hash: the hash of set of entities, used for checking duplicates
+            minhashes: the list of encoded minhashes 
+            compared_dict: dict keeping track of what were compared
+            df: the dataframe
+            first_iter: if this is the first iteration
+        '''
+        if name == 'entity':
+            intersect_column_name = 'sID'
+            union_column_name = 'pattern'
+        else:
+            intersect_column_name = 'pattern'
+            union_column_name = 'sID'
+
+        # update the hash sets
+        rel_hash, ent_hash = self.update_hash_sets(rel_hash, ent_hash, df)
+        # Encode the set
+        prev_count, lsh, minhashes = self.encode_sets(name, prev_count, lsh, minhashes, df)
+
+        assert rel_hash.shape[0] == ent_hash.shape[0] == prev_count
 
         heap = []
         # compute what is the maximum number of rows we can add to the dataframe
@@ -213,11 +270,26 @@ class CategoryFunction:
             candidates = lsh.query(query_mh) # get the sets that have high similarity
             for candidate in candidates: # for each set we get
                 j = int(candidate.split('_')[1])
-                if j != i and (j not in combined_dict[i]): # if it is not itself, nor already combined
-                    combined_dict[i].append(j) # record it as combined
-                    combined_dict[j].append(i) # add symmetric information
-                    union = set(df[union_column_name][i]).union(set(df[union_column_name][j])) # union of the rels
-                    intersect = set(df[intersect_column_name][i]).intersection(set(df[intersect_column_name][j])) # intersect of the ents
+                if j != i and (j not in compared_dict[i]): # if it is not itself, nor already compared
+                    compared_dict[i].append(j) # record it as compared
+                    compared_dict[j].append(i) # add symmetric information
+
+                    union = sorted(set(df[union_column_name][i]).union(set(df[union_column_name][j])))
+                    intersect = sorted(set(df[intersect_column_name][i]).intersection(set(df[intersect_column_name][j])))
+
+                    # does the created category already exist?
+                    if name == 'entity':
+                        # compare the rels
+                        rel_set = tuple(union)
+                        ent_set = tuple(intersect)         
+                    else:
+                        rel_set = tuple(intersect)
+                        ent_set = tuple(union)
+                    
+                    matching_rel = (rel_hash == hash(rel_set))
+
+                    if hash(ent_set) in ent_hash[matching_rel]:
+                        continue
 
                     if name == 'entity':
                         sup = len(intersect)
@@ -229,19 +301,14 @@ class CategoryFunction:
                                 intersect_column_name: list(intersect),
                                 } # a new row
                     
-                    heap_item = HeapItem(sup, new_row, (i, j))  # Negative sup for max-heap behavior
+                    heap_item = HeapItem(sup, new_row)
                     if max_aggr < 0:
-                        heappush(heap, heap_item)
+                        heap.append(heap_item) # no sorting required
                     else:
                         if len(heap) < max_aggr:
                             heappush(heap, heap_item)
                         else:
-                            item = heappushpop(heap, heap_item)
-                            # remove the popped index from combined dict
-                            k, l = item.indices
-                            combined_dict[k].remove(l)
-                            combined_dict[l].remove(k)
-
+                            heappushpop(heap, heap_item)
 
         if max_aggr > 0:
             new_rows = [item.row for item in sorted(heap, key=lambda x: x.sup, reverse=True)][:max_aggr]
@@ -251,10 +318,9 @@ class CategoryFunction:
             new_rows = [item.row for item in heap]
 
         new_rows_df = pd.DataFrame(new_rows)
-
         df = pd.concat([df, new_rows_df], ignore_index=True)
 
-        return prev_count, lsh, minhashes, combined_dict, df
+        return prev_count, lsh, rel_hash, ent_hash, minhashes, compared_dict, df
 
         
 

@@ -9,7 +9,7 @@ pip install torch_geometric
 pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.4.0+cpu.html
 pip install spmf pandas datasketch matplotlib
 ```
-To run the prefix span algorithm, we use the [SPMF software](https://www.philippe-fournier-viger.com/spmf/)
+To run the prefix span algorithm, we use the [SPMF software](https://www.philippe-fournier-viger.com/spmf/).
 You need to download [JDK23](https://www.oracle.com/java/technologies/downloads/) to run the SPMF software.
 
 ## Creating the Rule Graph

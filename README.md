@@ -52,7 +52,7 @@ The rule graph successfully captures the semantics of relations:
 - `adult` categories connect to `child` categories with `Parent_of` relations.
 
 ### 2. Limitations in Understanding Local Graph Structure
-The algorithm doesn't consider the local graph structure around each entity when creating categories. Ideally, we'd want separate adult and child categories for each isolated family to understand that entities should only connect within the same family. This limitation arises because categories are defined solely by the outgoing relation set of an entity. Future work should consider both relation sets and local graph structure in category construction.
+The algorithm doesn't consider the local graph structure around each entity when creating categories. Ideally, we'd want separate `adult` and `child` categories for each isolated family to understand that entities should only connect within the same family. This limitation arises because categories are defined solely by the outgoing relation set of an entity. Future work should consider both relation sets and local graph structure in category construction. This can be done using a random-walk based approach, for example.
 
 ### 3. Potential Relation Dropping
 The algorithm may drop relations deemed redundant. In our example, the `Spouse_of` relation is omitted because `Parent_of` already covers all adult entities. This can be problematic for anomaly detection of triples involving dropped relations. We propose adding a safeguard to ensure all relations are represented in the selected categories.

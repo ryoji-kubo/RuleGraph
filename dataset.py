@@ -156,8 +156,6 @@ class KGDataset(InMemoryDataset):
         data, all_data, node_dict, rel_dict = read_files(self.raw_file_names, self.folder)
         torch.save((data, all_data, node_dict, rel_dict), self.processed_paths[0])
 
-
-
 def build_dataset(name):
     if name == "FB15k-237":
         dataset = RelLinkPredDataset(name=name, root='dataset')

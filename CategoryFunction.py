@@ -3,14 +3,14 @@ from tqdm import tqdm
 import pandas as pd
 import os
 from collections import defaultdict
-from heapq import heappush, heappushpop, nlargest
+from heapq import heappush, heappushpop
 
 from spmf import Spmf
 from datasketch import MinHash, MinHashLSH
 from dataclasses import dataclass
 
 @dataclass
-class HeapItem:
+class HeapItem: # Class that help construct a heap
     sup: int
     row: dict
 
@@ -24,7 +24,6 @@ def to_pandas_dataframe_with_SIDs(self, pickle=False):
     Convert output to pandas DataFrame
     pickle: Save as serialized pickle
     """
-
     if not self.patterns_:
         self.parse_output()
 
